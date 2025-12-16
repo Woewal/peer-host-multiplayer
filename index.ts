@@ -1,7 +1,7 @@
 import { onMounted, onUnmounted, type Ref, ref } from "vue";
 
 import Peer, { type DataConnection } from "peerjs";
-import EventListener from "./utils/eventListener";
+import { EventListener } from "./utils/eventListener";
 import { injectLocal, provideLocal } from "@vueuse/core";
 
 export type Messages = {
@@ -9,8 +9,8 @@ export type Messages = {
 };
 
 export const generateHostHelpers = <
-  THostToClientMessages extends Messages,
-  TClientToHostMessages extends Messages
+  const THostToClientMessages extends Messages,
+  const TClientToHostMessages extends Messages
 >() => {
   type Connection = {
     id: string;
@@ -23,7 +23,7 @@ export const generateHostHelpers = <
   const createHost = () => {
     const peer = new Peer(Math.floor(Math.random() * 9999).toString(), {});
 
-    type HostMessages = THostToClientMessages & {
+    type HostMessages = TClientToHostMessages & {
       connect: [id: string];
       disconnect: [id: string];
     };
@@ -31,6 +31,15 @@ export const generateHostHelpers = <
     const roomId = ref<string>("");
 
     const connections = ref(new Map<string, Connection>());
+
+    const eventListener = new EventListener<
+      {
+        [K in keyof TClientToHostMessages]: [
+          id: string,
+          ...TClientToHostMessages[K]
+        ];
+      } & HostMessages
+    >();
 
     peer.on("open", function (id) {
       console.log("My peer ID is: " + id);
@@ -46,17 +55,8 @@ export const generateHostHelpers = <
     });
 
     peer.on("error", (error) => {
-      alert(error.message);
+      console.error(error.message);
     });
-
-    const eventListener = new EventListener<
-      {
-        [K in keyof TClientToHostMessages]: [
-          id: string,
-          ...TClientToHostMessages[K]
-        ];
-      } & HostMessages
-    >();
 
     peer.on("connection", (conn) => {
       connections.value.set(conn.connectionId, {
@@ -158,9 +158,9 @@ export const generateHostHelpers = <
     typeof createHost<THostToClientMessages, TClientToHostMessages>
   >;
 
-  const useHostEvent = (
-    key: keyof THostToClientMessages,
-    handler: (id: string, ...args: THostToClientMessages[typeof key]) => void
+  const useEvent = (
+    key: keyof TClientToHostMessages,
+    handler: (id: string, ...args: TClientToHostMessages[typeof key]) => void
   ) => {
     const host = useHost();
 
@@ -176,9 +176,10 @@ export const generateHostHelpers = <
       TClientToHostMessages & THostToClientMessages
     >();
 
-    const id = crypto.randomUUID();
+    // Use a cross-environment fallback for unique id
+    const id = `local-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 
-    const state: Client = {
+    const state: Client<THostToClientMessages, TClientToHostMessages> = {
       connected: ref(true),
       id,
       on: (key, handler) => eventListener.on(key, handler),
@@ -206,32 +207,19 @@ export const generateHostHelpers = <
     return state;
   };
 
-  export const useHost = () => {
+  const useHost = () => {
     return injectLocal<Host>("host")!;
   };
 
-  return { useHostEvent, createLocalClient, createHost, useClientEvent };
+  return {
+    useEvent,
+    createLocalClient,
+    createHost,
+    useClientMessage,
+  };
 };
 
-export const useClientEvent = <
-  THostToClientMessages extends Messages,
-  TKey extends THostToClientMessages
->(
-  key: TKey,
-  handler: (...args: THostToClientMessages[TKey]) => void
-) => {
-  const client = useClient();
-
-  onMounted(() => {
-    client.on(key, handler);
-  });
-
-  onUnmounted(() => {
-    client.off(key, handler);
-  });
-};
-
-// type ClientToHostMessages = {
+export // type ClientToHostMessages = {
 //   playCard: [card: 3];
 //   setMoney: [amount: number];
 // };
@@ -247,8 +235,8 @@ export const useClientEvent = <
 // };
 
 type Client<
-  THostToClientMessages extends Messages = {},
-  TClientToHostMessages extends Messages = {}
+  THostToClientMessages extends Messages,
+  TClientToHostMessages extends Messages
 > = {
   id: string;
   connected: Ref<boolean>;
@@ -266,72 +254,76 @@ type Client<
   ) => void;
 };
 
-export const createClient = <THostToClientMessages extends Messages = {}>(
-  id: string
-) => {
-  var peer = new Peer();
+export const generateClientHelpers = <
+  const THostToClientMessages extends Messages,
+  const TClientToHostMessages extends Messages
+>() => {
+  const createClient = <THostToClientMessages extends Messages = {}>(
+    id: string
+  ) => {
+    var peer = new Peer();
 
-  const eventListener = new EventListener<THostToClientMessages>();
+    const eventListener = new EventListener<THostToClientMessages>();
 
-  let conn: DataConnection;
+    let conn: DataConnection;
 
-  const connected = ref<boolean>(false);
+    const connected = ref<boolean>(false);
 
-  peer.on("open", () => {
-    conn = peer.connect(id);
+    peer.on("open", () => {
+      conn = peer.connect(id);
 
-    conn.on("open", () => {
-      connected.value = true;
+      conn.on("open", () => {
+        connected.value = true;
+      });
+
+      conn.on("data", (data) => {
+        if (typeof data != "object") return;
+
+        // @ts-ignore
+        const key: keyof THostToClientMessages = data["key"];
+        // @ts-ignore
+        const args: THostToClientMessages[typeof key] = data["args"];
+
+        eventListener.invoke(key, ...args);
+      });
     });
 
-    conn.on("data", (data) => {
-      if (typeof data != "object") return;
+    const state: Client<THostToClientMessages, TClientToHostMessages> = {
+      id,
+      connected,
+      send: (key, ...args) => conn?.send({ key, args }),
+      on: (key, handler) => eventListener.on(key, handler),
+      off: (key, handler) => eventListener.off(key, handler),
+    };
 
-      // @ts-ignore
-      const key: keyof THostToClientMessages = data["key"];
-      // @ts-ignore
-      const args: THostToClientMessages[typeof key] = data["args"];
+    provideLocal("client", state);
 
-      eventListener.invoke(key, ...args);
-    });
-  });
-
-  const state: Client = {
-    id,
-    connected,
-    send: (key, ...args) => conn?.send({ key, args }),
-    on: (key, handler) => eventListener.on(key, handler),
-    off: (key, handler) => eventListener.off(key, handler),
+    return state;
   };
 
-  provideLocal("client", state);
+  const useClient = () => {
+    return injectLocal<Client<THostToClientMessages, TClientToHostMessages>>(
+      "client"
+    )!;
+  };
 
-  return state;
+  const useEvent = <
+    const THostToClientMessages extends Messages,
+    TKey extends keyof THostToClientMessages
+  >(
+    key: TKey,
+    handler: (...args: THostToClientMessages[TKey]) => void
+  ) => {
+    const client = useClient();
+
+    onMounted(() => {
+      client.on(key, handler);
+    });
+
+    onUnmounted(() => {
+      client.off(key, handler);
+    });
+  };
+
+  return { createClient, useClient, useEvent };
 };
-
-export const useClient = () => {
-  return injectLocal<Client>("client")!;
-};
-
-// export const useClientMessage = <
-//   TClientsToHostMessages extends Messages,
-//   TKey extends keyof TClientsToHostMessages
-// >(
-//   clientId: string,
-//   key: TKey,
-//   fn: (...args: TClientsToHostMessages[TKey]) => void
-// ) => {
-//   const host = useHost();
-
-//   const handler = (id: string, ...args: TClientsToHostMessages[TKey]) => {
-//     if (id === clientId) {
-//       fn(...args);
-//     }
-//   };
-
-//   host.on(key, handler);
-
-//   onUnmounted(() => {
-//     host.off(key, handler);
-//   });
-// };
