@@ -1,4 +1,4 @@
-import { onMounted, onUnmounted, type Ref, ref } from "vue";
+import { onBeforeUnmount, onMounted, onUnmounted, type Ref, ref } from "vue";
 
 import Peer, { type DataConnection } from "peerjs";
 import { EventListener } from "./utils/eventListener";
@@ -20,38 +20,30 @@ export const generateHostHelpers = <
     ) => void;
   };
 
+  type HostMessages = TClientToHostMessages & {
+    connect: [];
+    disconnect: [];
+  };
+
   const createHost = () => {
     const peer = new Peer(Math.floor(Math.random() * 9999).toString(), {});
-
-    type HostMessages = TClientToHostMessages & {
-      connect: [id: string];
-      disconnect: [id: string];
-    };
 
     const roomId = ref<string>("");
 
     const connections = ref(new Map<string, Connection>());
 
-    const eventListener = new EventListener<
-      {
-        [K in keyof TClientToHostMessages]: [
-          id: string,
-          ...TClientToHostMessages[K]
-        ];
-      } & HostMessages
-    >();
+    const eventListener = new EventListener<{
+      [K in keyof HostMessages]: [id: string, ...HostMessages[K]];
+    }>();
 
     peer.on("open", function (id) {
       console.log("My peer ID is: " + id);
       roomId.value = id;
     });
 
-    peer.on("connection", (conn) => {
-      eventListener.invoke("connect", conn.connectionId);
-    });
-
     peer.on("disconnected", (id) => {
       eventListener.invoke("disconnect", id);
+      connections.value.delete(id);
     });
 
     peer.on("error", (error) => {
@@ -73,11 +65,9 @@ export const generateHostHelpers = <
 
         eventListener.invoke(data["key"], conn.connectionId, ...data["args"]);
       });
-    });
 
-    peer.on("disconnected", (connectedId) =>
-      eventListener.invoke("disconnect", connectedId)
-    );
+      eventListener.invoke("connect", conn.connectionId);
+    });
 
     const state = {
       roomId,
@@ -154,13 +144,11 @@ export const generateHostHelpers = <
     });
   };
 
-  type Host = ReturnType<
-    typeof createHost<THostToClientMessages, TClientToHostMessages>
-  >;
+  type Host = ReturnType<typeof createHost>;
 
-  const useEvent = (
-    key: keyof TClientToHostMessages,
-    handler: (id: string, ...args: TClientToHostMessages[typeof key]) => void
+  const useEvent = <TKey extends keyof HostMessages>(
+    key: TKey,
+    handler: (id: string, ...args: HostMessages[TKey]) => void
   ) => {
     const host = useHost();
 
@@ -214,27 +202,13 @@ export const generateHostHelpers = <
   return {
     useEvent,
     createLocalClient,
+    useHost,
     createHost,
     useClientMessage,
   };
 };
 
-export // type ClientToHostMessages = {
-//   playCard: [card: 3];
-//   setMoney: [amount: number];
-// };
-
-// type HostToClientMessages = {
-//   setColor: [color: string];
-//   setMoney: [amount: number];
-// };
-
-// type HostMessages = ClientToHostMessages & {
-//   connect: [id: string];
-//   disconnect: [id: string];
-// };
-
-type Client<
+export type Client<
   THostToClientMessages extends Messages,
   TClientToHostMessages extends Messages
 > = {
@@ -296,6 +270,18 @@ export const generateClientHelpers = <
       off: (key, handler) => eventListener.off(key, handler),
     };
 
+    const handleUnload = () => {
+      conn?.close();
+      peer.destroy();
+    };
+
+    window.addEventListener("beforeunload", handleUnload);
+
+    onBeforeUnmount(() => {
+      window.removeEventListener("beforeunload", handleUnload);
+      handleUnload();
+    });
+
     provideLocal("client", state);
 
     return state;
@@ -307,10 +293,7 @@ export const generateClientHelpers = <
     )!;
   };
 
-  const useEvent = <
-    const THostToClientMessages extends Messages,
-    TKey extends keyof THostToClientMessages
-  >(
+  const useEvent = <TKey extends keyof THostToClientMessages>(
     key: TKey,
     handler: (...args: THostToClientMessages[TKey]) => void
   ) => {
